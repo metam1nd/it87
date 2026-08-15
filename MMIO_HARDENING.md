@@ -4,6 +4,19 @@ This branch carries additional error handling and state-safety changes for the
 IT87 MMIO/H2RAM bridge path. It is based on upstream commit
 `490f76f61900c163fac5328506c49969bd716dc6`.
 
+## Upstream provenance
+
+The MMIO/H2RAM implementation itself was developed on upstream branch
+`h2ram-mmio` and merged into `master` through
+[upstream PR #102](https://github.com/frankcrawford/it87/pull/102) at commit
+`20f2f2f4c92c14fcdd26f60d050e693ad2c30bf8` on 2026-04-16. The tip of that
+historical branch, `60f2ef5cb85101c8181b5ce42362d41cfcb36e45`, is an ancestor
+of the `master` revision used here.
+
+This branch does not independently reimplement MMIO/H2RAM access. It hardens
+the implementation already present in `master`, which also contains later
+upstream fixes that are absent from the historical `h2ram-mmio` branch.
+
 ## Motivation
 
 Some recent Gigabyte boards expose their IT87 environment controller through
