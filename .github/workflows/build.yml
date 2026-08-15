@@ -1,0 +1,46 @@
+name: Build kernel module
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Ubuntu ${{ matrix.ubuntu }} headers
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu:
+          - "22.04"
+          - "24.04"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Build external module
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/src" \
+            --workdir /src \
+            "ubuntu:${{ matrix.ubuntu }}" \
+            bash -euxo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install --yes build-essential linux-headers-generic
+              headers="$(find /usr/src -maxdepth 1 -type d -name "linux-headers-*-generic" | sort -V | tail -n 1)"
+              test -n "$headers"
+              make TARGET=ci KERNEL_BUILD="$headers" DRIVER_VERSION="ci-${{ matrix.ubuntu }}"
+              test -s it87.ko
+            '
