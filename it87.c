@@ -6080,6 +6080,13 @@ static int __init it87_device_add(int index, unsigned short sio_address,
 		phys_addr_t start = mmio_address;
 		phys_addr_t end   = mmio_address + MMIO_HI_BOUND; /* 0x000–0x3FF */
 
+		/*
+		 * The chipset's 64 KiB decode is a forwarding aperture, not
+		 * exclusive IT87 ownership.  Reserve only the IT87 register subrange
+		 * modeled by this child; firmware may describe the full aperture as
+		 * its parent resource.
+		 */
+
 		/* H2RAM chips have an extra EC/HWM block mapped into the window
 	 * at base+0x900..base+0xCFF instead of base+0x000..base+0x3FF. */
 		if (sio_data->mmio_h2ram)
