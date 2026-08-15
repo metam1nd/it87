@@ -6295,20 +6295,24 @@ static int __init sm_it87_init(void)
 			if (!it87_h2_global_inited) {
 				ret = it87_h2_global_init();
 				if (ret) {
-					pr_debug("H2RAM global bridge init failed: %d\n",
-			     ret);
-				} else {
-					it87_h2_global_inited = true;
+					pr_err("H2RAM global bridge init failed: %d\n", ret);
+					err = ret;
+					goto exit_unregister;
 				}
+				it87_h2_global_inited = true;
 			}
-			if (it87_h2_global_ready) {
-				/* slot 0 = 0x2E, slot 1 = 0x4E */
-				slot = (sioaddr[i]==REG_4E) ? 1 : 0;
-				ret = it87_h2_global_set_slot(slot, base);
-				if (ret) {
-					pr_debug("H2RAM set_slot(%d,%pa) failed: %d\n",
-			     slot, &base, ret);
-				}
+			if (!it87_h2_global_ready) {
+				err = -ENODEV;
+				goto exit_unregister;
+			}
+			/* slot 0 = 0x2E, slot 1 = 0x4E */
+			slot = (sioaddr[i]==REG_4E) ? 1 : 0;
+			ret = it87_h2_global_set_slot(slot, base);
+			if (ret) {
+				pr_err("H2RAM set_slot(%d,%pa) failed: %d\n",
+				       slot, &base, ret);
+				err = ret;
+				goto exit_unregister;
 			}
 		}
 
@@ -6325,14 +6329,28 @@ static int __init sm_it87_init(void)
 	return 0;
 
 exit_unregister:
+	if (it87_pdev[1]) {
+		platform_device_unregister(it87_pdev[1]);
+		it87_pdev[1] = NULL;
+	}
+	if (it87_pdev[0]) {
+		platform_device_unregister(it87_pdev[0]);
+		it87_pdev[0] = NULL;
+	}
+	it87_h2_global_release();
 	platform_driver_unregister(&it87_driver);
 	return err;
 }
 
 static void __exit sm_it87_exit(void) {
-	/* NULL check handled by platform_device_unregister */
-	platform_device_unregister(it87_pdev[1]);
-	platform_device_unregister(it87_pdev[0]);
+	if (it87_pdev[1]) {
+		platform_device_unregister(it87_pdev[1]);
+		it87_pdev[1] = NULL;
+	}
+	if (it87_pdev[0]) {
+		platform_device_unregister(it87_pdev[0]);
+		it87_pdev[0] = NULL;
+	}
 	it87_h2_global_release();
 	platform_driver_unregister(&it87_driver);
 }
