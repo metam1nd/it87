@@ -33,14 +33,19 @@ The branch therefore:
 - requires a complete snapshot before modifying bridge registers;
 - rolls back partial AMD and Intel bridge programming;
 - validates both slots and tracks the active slot explicitly;
+- activates each configured slot before accepting device initialization;
+- rejects platform devices whose synchronous driver probe did not bind;
 - serializes global bridge changes;
 - restores firmware bridge state for suspend and rebuilds it on resume;
+- activates the resumed device's slot before controller validation;
+- retains compatibility fallbacks for older kernel APIs;
 - balances PCI enable/reference handling; and
 - unwinds partial platform-device registration when bridge setup fails.
 
 ## Hardware validation
 
-The combined result represented by this branch has been used on:
+The pre-review driver snapshot at branch commit `e63e935db8f2999d23956c60be4881cf5763e536`
+(`it87.c` blob `86239dbcbc99e963cb63d2b798665821428c89a8`) has been used on:
 
 - Motherboard: Gigabyte B760 GAMING X
 - Firmware: BIOS F18a
@@ -58,6 +63,10 @@ No userspace `fancontrol` daemon was installed during that capture, so this is
 not a claim that an automatic userspace fan curve has been endurance-tested.
 It is evidence that the module builds, loads, discovers the controller through
 the Gigabyte bridge path, and exposes the expected hwmon interfaces.
+
+The subsequent review fixes that activate bridge slots before validation,
+verify platform-driver binding, and restore old-kernel API compatibility have
+not yet been installed, loaded, or suspend/resume tested on that system.
 
 ## Review and testing guidance
 

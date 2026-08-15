@@ -229,16 +229,26 @@ static inline void superio_exit(int ioreg, bool noexit)
 	release_region(ioreg, 2);
 }
 
+/*
+ * PCI configuration helpers return PCIBIOS_* status values.  Keep the
+ * conversion local because pcibios_err_to_errno() is not available on every
+ * kernel supported by this out-of-tree driver.
+ */
+static inline int it87_pcibios_err_to_errno(int status)
+{
+	return status ? -EIO : 0;
+}
+
 /* PCI Read Routine */
 static inline int pci_reg_read(struct pci_dev *d, u16 off, u32 *v)
 {
-	return pcibios_err_to_errno(pci_read_config_dword(d, off, v));
+	return it87_pcibios_err_to_errno(pci_read_config_dword(d, off, v));
 }
 
 /* PCI Write Routine */
 static inline int pci_reg_write(struct pci_dev *d, u16 off, u32 v)
 {
-	return pcibios_err_to_errno(pci_write_config_dword(d, off, v));
+	return it87_pcibios_err_to_errno(pci_write_config_dword(d, off, v));
 }
 
 /* Logical device 4 registers */
@@ -1727,7 +1737,8 @@ static int it87_h2_init(struct it87_h2ram_handle *h)
 					pci_disable_device(h->bridge);
 					pci_dev_put(h->bridge);
 					h->bridge = NULL;
-					return hret < 0 ? hret : pcibios_err_to_errno(hret);
+					return hret < 0 ? hret :
+						it87_pcibios_err_to_errno(hret);
 				}
 			}
 			ret = _save_regs(h);
@@ -1864,7 +1875,7 @@ static int it87_h2_global_init(void)
 	return ret;
 }
 
-/* Configure a slot (just updates state, does not touch PCI yet) */
+/* Configure and activate a slot so callers observe bridge write failures. */
 static int it87_h2_global_set_slot(int idx, u64 mmio_base)
 {
 	int ret;
@@ -1875,13 +1886,15 @@ static int it87_h2_global_set_slot(int idx, u64 mmio_base)
 		goto unlock;
 	}
 	ret = it87_h2_set_slot(&it87_h2_global, idx, mmio_base);
+	if (!ret)
+		ret = it87_h2_use_slot(&it87_h2_global, idx);
 
 unlock:
 	mutex_unlock(&mmio_lock);
 	return ret;
 }
 
-static int it87_h2_global_prepare_resume(void)
+static int it87_h2_global_prepare_resume(int idx)
 {
 	int ret = 0;
 
@@ -1905,6 +1918,7 @@ static int it87_h2_global_prepare_resume(void)
 
 	it87_h2_global.current_base = 0;
 	it87_h2_global.current_slot = -1;
+	ret = it87_h2_use_slot(&it87_h2_global, idx);
 
 unlock:
 	mutex_unlock(&mmio_lock);
@@ -5899,7 +5913,17 @@ static int it87_suspend(struct device *dev)
 		mutex_unlock(&mmio_lock);
 	}
 	if (err && data) {
-		int recovery_err = it87_lock(data);
+		int slot = data->sioaddr == REG_4E ? 1 : 0;
+		int recovery_err;
+
+		recovery_err = it87_h2_global_prepare_resume(slot);
+		if (recovery_err) {
+			dev_err(dev, "Unable to reactivate MMIO bridge after failed suspend: %d\n",
+				recovery_err);
+			return err;
+		}
+
+		recovery_err = it87_lock(data);
 
 		if (recovery_err) {
 			dev_err(dev, "Unable to restore PWM access after failed suspend: %d\n",
@@ -5922,7 +5946,9 @@ static int it87_resume(struct device *dev)
 	int err;
 
 	if (data->mmio_bridge || data->mmio_h2ram) {
-		err = it87_h2_global_prepare_resume();
+		int slot = data->sioaddr == REG_4E ? 1 : 0;
+
+		err = it87_h2_global_prepare_resume(slot);
 		if (err)
 			return err;
 	}
@@ -6070,10 +6096,18 @@ static int __init it87_device_add(int index, unsigned short sio_address,
 		pr_err("Device addition failed (%d)\n", err);
 		goto exit_device_put;
 	}
+	if (pdev->dev.driver != &it87_driver.driver) {
+		pr_err("Device probe failed for Super I/O at %#x\n",
+		       sio_address);
+		err = -ENODEV;
+		goto exit_device_del;
+	}
 
 	it87_pdev[index] = pdev;
 	return 0;
 
+exit_device_del:
+	platform_device_del(pdev);
 exit_device_put:
 	platform_device_put(pdev);
 	return err;

@@ -72,6 +72,14 @@ u8 vid_which_vrm(void)
 #define kobj_to_dev(kobj)	container_of(kobj, struct device, kobj)
 #endif
 
+#ifndef READ_ONCE
+#ifdef ACCESS_ONCE
+#define READ_ONCE(x)	ACCESS_ONCE(x)
+#else
+#define READ_ONCE(x)	(*(volatile typeof(x) *)&(x))
+#endif
+#endif
+
 #ifndef DEFINE_SIMPLE_DEV_PM_OPS
 /*
  * New API in 5.17
@@ -80,6 +88,7 @@ u8 vid_which_vrm(void)
 	SIMPLE_DEV_PM_OPS(name, suspend_fn, resume_fn)
 
 static void __maybe_unused it87_resume_sio(struct platform_device *pdev);
+static int __maybe_unused it87_suspend(struct device *dev);
 static int __maybe_unused it87_resume(struct device *dev);
 #endif
 
