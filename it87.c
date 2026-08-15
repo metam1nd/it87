@@ -1065,6 +1065,7 @@ struct it87_data {
 	 * simple.
 	 */
 	u8 has_pwm;		/* Bitfield, pwm control enabled */
+	bool pwm_writable;	/* PWM register configuration passed safety checks */
 	u8 pwm_ctrl[NUM_PWM];	/* Register value */
 	u8 pwm_duty[NUM_PWM];	/* Manual PWM value set by user */
 	u8 pwm_temp_map[NUM_PWM];/* PWM to temp. chan. mapping (bits 1-0) */
@@ -2450,6 +2451,22 @@ static void it87_unlock(struct it87_data *data)
 	mutex_unlock(&data->update_lock);
 }
 
+static int it87_pwm_lock(struct it87_data *data)
+{
+	int err;
+
+	if (!READ_ONCE(data->pwm_writable))
+		return -EIO;
+	err = it87_lock(data);
+	if (err)
+		return err;
+	if (!data->pwm_writable) {
+		it87_unlock(data);
+		return -EIO;
+	}
+	return 0;
+}
+
 static struct it87_data *it87_update_device(struct device *dev)
 {
 	struct it87_data *data = dev_get_drvdata(dev);
@@ -3197,17 +3214,17 @@ static ssize_t set_pwm_enable(struct device *dev, struct device_attribute *attr,
 	if (kstrtol(buf, 10, &val) < 0 || val < 0 || val > 2)
 		return -EINVAL;
 
-	/* Check trip points before switching to automatic mode */
-	if (val == 2) {
-		if (check_trip_points(dev, nr) < 0)
-			return -EINVAL;
-	}
-
-	err = it87_lock(data);
+	err = it87_pwm_lock(data);
 	if (err)
 		return err;
 
 	it87_update_pwm_ctrl(data, nr);
+
+	/* Check trip points before switching to automatic mode. */
+	if (val == 2 && check_trip_points(dev, nr) < 0) {
+		it87_unlock(data);
+		return -EINVAL;
+	}
 
 	if (val == 0) {
 		if (nr < 3 && has_fanctl_onoff(data)) {
@@ -3282,7 +3299,7 @@ static ssize_t set_pwm(struct device *dev, struct device_attribute *attr,
 	if (kstrtol(buf, 10, &val) < 0 || val < 0 || val > 255)
 		return -EINVAL;
 
-	err = it87_lock(data);
+	err = it87_pwm_lock(data);
 	if (err)
 		return err;
 
@@ -3338,7 +3355,7 @@ static ssize_t set_pwm_freq(struct device *dev, struct device_attribute *attr,
 			break;
 	}
 
-	err = it87_lock(data);
+	err = it87_pwm_lock(data);
 	if (err)
 		return err;
 
@@ -3387,7 +3404,7 @@ static ssize_t set_pwm_temp_map(struct device *dev,
 
 	map = val - 1;
 
-	err = it87_lock(data);
+	err = it87_pwm_lock(data);
 	if (err)
 		return err;
 
@@ -3436,7 +3453,7 @@ static ssize_t set_auto_pwm(struct device *dev, struct device_attribute *attr,
 	if (kstrtol(buf, 10, &val) < 0 || val < 0 || val > 255)
 		return -EINVAL;
 
-	err = it87_lock(data);
+	err = it87_pwm_lock(data);
 	if (err)
 		return err;
 
@@ -3476,7 +3493,7 @@ static ssize_t set_auto_pwm_slope(struct device *dev,
 	if (kstrtoul(buf, 10, &val) < 0 || val > 127)
 		return -EINVAL;
 
-	err = it87_lock(data);
+	err = it87_pwm_lock(data);
 	if (err)
 		return err;
 
@@ -3522,7 +3539,7 @@ static ssize_t set_auto_temp(struct device *dev, struct device_attribute *attr,
 	if (kstrtol(buf, 10, &val) < 0 || val < -128000 || val > 127000)
 		return -EINVAL;
 
-	err = it87_lock(data);
+	err = it87_pwm_lock(data);
 	if (err)
 		return err;
 
@@ -5581,6 +5598,7 @@ static int it87_probe(struct platform_device *pdev)
 	}
 
 	enable_pwm_interface = it87_check_pwm(dev);
+	data->pwm_writable = enable_pwm_interface;
 	if (!enable_pwm_interface)
 		dev_info(dev, "Detected broken BIOS defaults, disabling PWM interface\n");
 
