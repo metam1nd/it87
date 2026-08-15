@@ -1875,7 +1875,7 @@ static int it87_h2_global_init(void)
 	return ret;
 }
 
-/* Configure and activate a slot so callers observe bridge write failures. */
+/* Prepare a slot; activation is deferred until the resource-backed probe. */
 static int it87_h2_global_set_slot(int idx, u64 mmio_base)
 {
 	int ret;
@@ -1886,10 +1886,21 @@ static int it87_h2_global_set_slot(int idx, u64 mmio_base)
 		goto unlock;
 	}
 	ret = it87_h2_set_slot(&it87_h2_global, idx, mmio_base);
-	if (!ret)
-		ret = it87_h2_use_slot(&it87_h2_global, idx);
 
 unlock:
+	mutex_unlock(&mmio_lock);
+	return ret;
+}
+
+static int it87_h2_global_activate_slot(int idx)
+{
+	int ret;
+
+	mutex_lock(&mmio_lock);
+	if (!it87_h2_global_ready)
+		ret = -ENODEV;
+	else
+		ret = it87_h2_use_slot(&it87_h2_global, idx);
 	mutex_unlock(&mmio_lock);
 	return ret;
 }
@@ -5746,6 +5757,19 @@ static int it87_probe(struct platform_device *pdev)
 	/* Initialize register accessors (select IO vs MMIO backend) */
 	it87_init_regs(pdev);
 
+	/*
+	 * platform_device_add() has reserved the MMIO resource before probe.
+	 * Activate it explicitly here so hybrid H2RAM probes, whose early
+	 * register accesses use legacy I/O, also validate bridge programming.
+	 */
+	if (data->mmio_bridge || data->mmio_h2ram) {
+		int slot = data->sioaddr == REG_4E ? 1 : 0;
+
+		err = it87_h2_global_activate_slot(slot);
+		if (err)
+			return err;
+	}
+
 	/* Disable SMBus shadowing while probing sensor blocks */
 	err = smbus_disable(data);
 	if (err)
@@ -6096,6 +6120,10 @@ static int __init it87_device_add(int index, unsigned short sio_address,
 		pr_err("Device addition failed (%d)\n", err);
 		goto exit_device_put;
 	}
+	/*
+	 * Probing is synchronous by default.  If it was forced asynchronous,
+	 * reject the not-yet-bound device rather than accepting unvalidated MMIO.
+	 */
 	if (pdev->dev.driver != &it87_driver.driver) {
 		pr_err("Device probe failed for Super I/O at %#x\n",
 		       sio_address);

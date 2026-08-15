@@ -33,7 +33,7 @@ The branch therefore:
 - requires a complete snapshot before modifying bridge registers;
 - rolls back partial AMD and Intel bridge programming;
 - validates both slots and tracks the active slot explicitly;
-- activates each configured slot before accepting device initialization;
+- activates each configured slot during probe, after reserving its MMIO range;
 - rejects platform devices whose synchronous driver probe did not bind;
 - serializes global bridge changes;
 - restores firmware bridge state for suspend and rebuilds it on resume;
