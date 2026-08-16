@@ -1918,7 +1918,7 @@ static int it87_h2_global_init(void)
 	return ret;
 }
 
-/* Configure a slot (just updates state, does not touch PCI yet) */
+/* Prepare a slot; activation is deferred until the resource-backed probe. */
 static int it87_h2_global_set_slot(int idx, u64 mmio_base)
 {
 	int ret;
@@ -1931,6 +1931,19 @@ static int it87_h2_global_set_slot(int idx, u64 mmio_base)
 	ret = it87_h2_set_slot(&it87_h2_global, idx, mmio_base);
 
 unlock:
+	mutex_unlock(&mmio_lock);
+	return ret;
+}
+
+static int it87_h2_global_activate_slot(int idx)
+{
+	int ret;
+
+	mutex_lock(&mmio_lock);
+	if (!it87_h2_global_ready)
+		ret = -ENODEV;
+	else
+		ret = it87_h2_use_slot(&it87_h2_global, idx);
 	mutex_unlock(&mmio_lock);
 	return ret;
 }
@@ -5739,6 +5752,22 @@ static int it87_probe(struct platform_device *pdev)
 
 	/* Initialize register accessors (select IO vs MMIO backend) */
 	it87_init_regs(pdev);
+
+	/*
+	 * devm_ioremap_resource() above has claimed the MMIO subrange.  Activate
+	 * the bridge explicitly here so hybrid H2RAM probes, whose early register
+	 * accesses use legacy I/O, also validate bridge programming.
+	 */
+	if (data->mmio_bridge || data->mmio_h2ram) {
+		int slot = data->sioaddr == REG_4E ? 1 : 0;
+
+		err = it87_h2_global_activate_slot(slot);
+		if (err) {
+			dev_err(dev, "Failed to activate ISA bridge slot %d: %d\n",
+				slot, err);
+			return err;
+		}
+	}
 
 	/* Disable SMBus shadowing while probing sensor blocks */
 	err = smbus_disable(data);
