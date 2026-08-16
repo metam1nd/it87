@@ -1523,60 +1523,102 @@ static u16 _intel_bios_mask_for_feat_space(u32 base)
 
 /* ----- internal save/restore of original bridge state ----- */
 
-static void _save_regs(struct it87_h2ram_handle *h)
+static int _save_regs(struct it87_h2ram_handle *h)
 {
+	int ret;
 	u16 v;
 
-	if (!h || !h->bridge || h->saved) return;
+	if (!h || !h->bridge)
+		return -EINVAL;
+	if (h->saved)
+		return 0;
 
 	v = h->bridge->vendor;
 	if (v == IT87_H2_VENDOR_AMD) {
-		pci_reg_read(h->bridge, 0x48, &h->or48);
-		pci_reg_read(h->bridge, 0x60, &h->or60);
-		pci_reg_read(h->bridge, 0x6C, &h->or6c);
+		ret = pci_reg_read(h->bridge, 0x48, &h->or48);
+		if (ret)
+			return ret;
+		ret = pci_reg_read(h->bridge, 0x60, &h->or60);
+		if (ret)
+			return ret;
+		ret = pci_reg_read(h->bridge, 0x6C, &h->or6c);
+		if (ret)
+			return ret;
 	} else if (v == IT87_H2_VENDOR_INTEL) {
-		pci_reg_read(h->bridge, 0xD8, &h->ord8);
-		pci_reg_read(h->bridge, 0x98, &h->or98);
+		ret = pci_reg_read(h->bridge, 0xD8, &h->ord8);
+		if (ret)
+			return ret;
+		ret = pci_reg_read(h->bridge, 0x98, &h->or98);
+		if (ret)
+			return ret;
 		if (h->hidden_ready && h->hidden_base) {
 			void __iomem *hb = ioremap(h->hidden_base, 0x200);
-			if (hb) {
-				h->hidden_orig_0x40 = readl(hb + 0x40);
-				h->hidden_orig_0x44 = readl(hb + 0x44);
-				iounmap(hb);
-			} else {
-				h->hidden_orig_0x40 = 0;
-				h->hidden_orig_0x44 = 0;
-			}
+
+			if (!hb)
+				return -ENOMEM;
+			h->hidden_orig_0x40 = readl(hb + 0x40);
+			h->hidden_orig_0x44 = readl(hb + 0x44);
+			iounmap(hb);
 		}
+	} else {
+		return -ENODEV;
 	}
 	h->saved = true;
+	return 0;
 }
 
-static void _restore_regs(struct it87_h2ram_handle *h)
+static int _restore_regs(struct it87_h2ram_handle *h)
 {
+	int ret;
 	u16 v;
 
-	if (!h || !h->bridge || !h->saved) return;
+	if (!h || !h->bridge)
+		return -EINVAL;
+	if (!h->saved)
+		return 0;
 
 	v = h->bridge->vendor;
 	if (v == IT87_H2_VENDOR_AMD) {
-		pci_reg_write(h->bridge, 0x48, h->or48);
-		pci_reg_write(h->bridge, 0x60, h->or60);
-		pci_reg_write(h->bridge, 0x6C, h->or6c);
+		/* Disable the decode before restoring its range registers. */
+		ret = pci_reg_write(h->bridge, 0x48, h->or48 & ~BIT(5));
+		if (ret)
+			return ret;
 		h->current_base = 0;
+		ret = pci_reg_write(h->bridge, 0x60, h->or60);
+		if (ret)
+			return ret;
+		ret = pci_reg_write(h->bridge, 0x6C, h->or6c);
+		if (ret)
+			return ret;
+		return pci_reg_write(h->bridge, 0x48, h->or48);
 	} else if (v == IT87_H2_VENDOR_INTEL) {
-		/* Mirror hidden first, then PCI config */
+		void __iomem *hb = NULL;
+
 		if (h->hidden_ready && h->hidden_base) {
-			void __iomem *hb = ioremap(h->hidden_base, 0x200);
-			if (hb) {
-				writel(h->hidden_orig_0x40, hb + 0x40);
-				writel(h->hidden_orig_0x44, hb + 0x44);
-				iounmap(hb);
-			}
+			hb = ioremap(h->hidden_base, 0x200);
+			if (!hb)
+				return -ENOMEM;
+			writel(h->hidden_orig_0x40 & ~BIT(0), hb + 0x40);
 		}
-		pci_reg_write(h->bridge, 0xD8, h->ord8);
-		pci_reg_write(h->bridge, 0x98, h->or98);
+		ret = pci_reg_write(h->bridge, 0x98, h->or98 & ~BIT(0));
 		h->current_base = 0;
+		if (ret)
+			goto unmap;
+		if (hb)
+			writel(h->hidden_orig_0x44, hb + 0x44);
+		ret = pci_reg_write(h->bridge, 0xD8, h->ord8);
+		if (ret)
+			goto unmap;
+		if (hb)
+			writel(h->hidden_orig_0x40, hb + 0x40);
+		ret = pci_reg_write(h->bridge, 0x98, h->or98);
+
+unmap:
+		if (hb)
+			iounmap(hb);
+		return ret;
+	} else {
+		return -ENODEV;
 	}
 }
 
@@ -1592,25 +1634,36 @@ static void _restore_regs(struct it87_h2ram_handle *h)
  *               0x6C=(0xFFFF0000 | END)
  *               0x48: set bit5
  */
- static int _amd_enable_slot(struct it87_h2ram_handle *h, int idx)
- {
-	 int ret;
+	 static int _amd_enable_slot(struct it87_h2ram_handle *h, int idx)
+	 {
+	 int restore_ret, ret;
 
 	 if (!h || !h->bridge) return -ENODEV;
 	 if (idx < 0 || idx > 1) return -EINVAL;
 	 if (!h->have[idx]) return -EINVAL;
 
+	 ret = pci_reg_write(h->bridge, 0x48, h->r48[idx] & ~BIT(5));
+	 if (ret)
+		 return ret;
+
 	 ret = pci_reg_write(h->bridge, 0x60, h->r60[idx]);
-	 if (ret) return ret;
+	 if (ret)
+		 goto restore;
 
 	 ret = pci_reg_write(h->bridge, 0x6C, h->r6c[idx]);
-	 if (ret) return ret;
+	 if (ret)
+		 goto restore;
 
 	 ret = pci_reg_write(h->bridge, 0x48, h->r48[idx]);
-	 if (ret) return ret;
+	 if (ret)
+		 goto restore;
 
 	 h->current_base = h->base[idx];
 	 return 0;
+
+restore:
+	 restore_ret = _restore_regs(h);
+	 return restore_ret ? restore_ret : ret;
  }
 
 /* Intel:
@@ -1619,9 +1672,10 @@ static void _restore_regs(struct it87_h2ram_handle *h)
  *        - slot0: clear bit0
  *        - slot1: clear one bit chosen from address tables
  */
- static int _intel_enable_slot(struct it87_h2ram_handle *h, int idx)
+static int _intel_enable_slot(struct it87_h2ram_handle *h, int idx)
 {
-	int ret;
+	void __iomem *hb = NULL;
+	int restore_ret, ret;
 
 	if (!h || !h->bridge) return -ENODEV;
 	if (idx < 0 || idx > 1) return -EINVAL;
@@ -1632,23 +1686,37 @@ static void _restore_regs(struct it87_h2ram_handle *h)
 
 	/* Hidden-window mirror first if available */
 	if (h->hidden_ready) {
-		void __iomem *hb = ioremap(h->hidden_base, 0x200);
-		if (hb) {
-			writel(h->r98[idx], hb + 0x40);
-			writel(h->rd8[idx], hb + 0x44);
-			iounmap(hb);
-		}
+		hb = ioremap(h->hidden_base, 0x200);
+		if (!hb)
+			return -ENOMEM;
+		writel(h->r98[idx] & ~BIT(0), hb + 0x40);
 	}
 
-	/* Then program PCI config */
+	/* Keep the decode disabled while changing its base and mask. */
+	ret = pci_reg_write(h->bridge, 0x98, h->r98[idx] & ~BIT(0));
+	if (ret)
+		goto restore;
+	if (hb)
+		writel(h->rd8[idx], hb + 0x44);
 	ret = pci_reg_write(h->bridge, 0xD8, h->rd8[idx]);
-	if (ret) return ret;
-
+	if (ret)
+		goto restore;
+	if (hb)
+		writel(h->r98[idx], hb + 0x40);
 	ret = pci_reg_write(h->bridge, 0x98, h->r98[idx]);
-	if (ret) return ret;
+	if (ret)
+		goto restore;
+	if (hb)
+		iounmap(hb);
 
 	h->current_base = h->base[idx];
 	return 0;
+
+restore:
+	if (hb)
+		iounmap(hb);
+	restore_ret = _restore_regs(h);
+	return restore_ret ? restore_ret : ret;
 }
 
 static int _enable_slot(struct it87_h2ram_handle *h, int idx)
@@ -1705,7 +1773,13 @@ static int it87_h2_init(struct it87_h2ram_handle *h)
 						it87_pcibios_err_to_errno(hret);
 				}
 			}
-			_save_regs(h);
+			ret = _save_regs(h);
+			if (ret) {
+				pci_disable_device(h->bridge);
+				pci_dev_put(h->bridge);
+				h->bridge = NULL;
+				return ret;
+			}
 			return 0;
 		}
 		pdev = pci_get_class((PCI_CLASS_BRIDGE_ISA << 8), pdev);
@@ -1767,7 +1841,8 @@ static int it87_h2_use_slot(struct it87_h2ram_handle *h, int idx)
 static void it87_h2_release(struct it87_h2ram_handle *h)
 {
 	if (!h || !h->bridge)return;
-	_restore_regs(h);
+	if (_restore_regs(h))
+		pr_err("Failed to restore ISA bridge state during release\n");
 	pci_disable_device(h->bridge);
 	pci_dev_put(h->bridge);
 	h->bridge = NULL;
