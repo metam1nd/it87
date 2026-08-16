@@ -229,16 +229,26 @@ static inline void superio_exit(int ioreg, bool noexit)
 	release_region(ioreg, 2);
 }
 
+/*
+ * PCI configuration helpers return PCIBIOS_* status values.  Keep the
+ * conversion local because pcibios_err_to_errno() is not available on every
+ * kernel supported by this out-of-tree driver.
+ */
+static inline int it87_pcibios_err_to_errno(int status)
+{
+	return status ? -EIO : 0;
+}
+
 /* PCI Read Routine */
 static inline int pci_reg_read(struct pci_dev *d, u16 off, u32 *v)
 {
-	return pci_read_config_dword(d, off, v);
+	return it87_pcibios_err_to_errno(pci_read_config_dword(d, off, v));
 }
 
 /* PCI Write Routine */
 static inline int pci_reg_write(struct pci_dev *d, u16 off, u32 v)
 {
-	return pci_write_config_dword(d, off, v);
+	return it87_pcibios_err_to_errno(pci_write_config_dword(d, off, v));
 }
 
 /* Logical device 4 registers */
@@ -1333,18 +1343,23 @@ enum it87_isabridge_type {
 /* ==== BEGIN: Global H2RAM / ISA-bridge MMIO manager and hybrid accessors ==== */
 
 /* Helpers for Intel type bridges */
-static inline void it87_hidden_cleanup(struct pci_dev *pch_f0,
-									   struct pci_dev *pch_f1,
-									   bool e1_changed)
+static inline int it87_hidden_cleanup(struct pci_dev *pch_f0,
+									  struct pci_dev *pch_f1,
+									  bool e1_changed,
+									  u8 e1_restore)
 {
+	int ret = 0;
+
 	if (pch_f1 && e1_changed) {
-		pci_write_config_byte(pch_f1, 0xE1, 0xFF);
+		ret = it87_pcibios_err_to_errno(
+			pci_write_config_byte(pch_f1, 0xE1, e1_restore));
 		msleep(1);
 	}
 	if (pch_f1)
 		pci_dev_put(pch_f1);
 	if (pch_f0)
 		pci_dev_put(pch_f0);
+	return ret;
 }
 
 /* checks for compatible skylake bridges */
@@ -1382,7 +1397,7 @@ static int it87_intel_init_hidden(struct it87_h2ram_handle *h)
 	u32 bar0 = 0;
 	u8 e1 = 0;
 	bool e1_changed = false;
-	int ret;
+	int cleanup_ret, ret;
 	u32 hidden_ofs = 0;
 	u8 platform = 0;
 	int siv_ret;
@@ -1417,39 +1432,55 @@ static int it87_intel_init_hidden(struct it87_h2ram_handle *h)
 		if (hidden_ofs == IT87_HIDDEN_OFS_Z390) {
 			h->hidden_base = IT87_HIDDEN_BASE_Z390_FALLBACK;
 			h->hidden_ready = true;
-			it87_hidden_cleanup(pch_f0, NULL, false);
-			return 0;
+			ret = 0;
+		} else {
+			ret = -ENODEV;
 		}
-		it87_hidden_cleanup(pch_f0, NULL, false);
-		return -ENODEV;
-		}
+		goto cleanup;
+	}
 
-	ret = pci_read_config_byte(pch_f1, 0xE1, &e1);
-	if (ret) { it87_hidden_cleanup(pch_f0, pch_f1, false); return ret; }
+	ret = it87_pcibios_err_to_errno(
+		pci_read_config_byte(pch_f1, 0xE1, &e1));
+	if (ret)
+		goto cleanup;
 	if (e1 != 0x10) {
-		ret = pci_write_config_byte(pch_f1, 0xE1, 0x10);
-		if (ret) { it87_hidden_cleanup(pch_f0, pch_f1, false); return ret; }
+		ret = it87_pcibios_err_to_errno(
+			pci_write_config_byte(pch_f1, 0xE1, 0x10));
+		if (ret)
+			goto cleanup;
 		msleep(1);
 		e1_changed = true;
 	}
 
-	ret = pci_read_config_dword(pch_f1, 0x10, &bar0);
-	if (ret) { it87_hidden_cleanup(pch_f0, pch_f1, e1_changed); return ret; }
+	ret = it87_pcibios_err_to_errno(
+		pci_read_config_dword(pch_f1, 0x10, &bar0));
+	if (ret)
+		goto cleanup;
 	if (!bar0 || bar0 == 0xFFFFFFFFu) {
 		/* BAR0 unavailable: apply Z390 fixed base fallback when requested */
 		if (hidden_ofs == IT87_HIDDEN_OFS_Z390) {
 			h->hidden_base = IT87_HIDDEN_BASE_Z390_FALLBACK;
 			h->hidden_ready = true;
-			it87_hidden_cleanup(pch_f0, pch_f1, e1_changed);
-			return 0;
+			ret = 0;
+		} else {
+			ret = -EIO;
 		}
-		it87_hidden_cleanup(pch_f0, pch_f1, e1_changed);
-		return -EIO;
+		goto cleanup;
 	}
 	h->hidden_base = (bar0 & 0xFF000000u) + hidden_ofs;
 	h->hidden_ready = true;
-	it87_hidden_cleanup(pch_f0, pch_f1, e1_changed);
-	return 0;
+	ret = 0;
+
+cleanup:
+	cleanup_ret = it87_hidden_cleanup(pch_f0, pch_f1, e1_changed, e1);
+	if (cleanup_ret) {
+		if (ret)
+			pr_warn("Failed to restore Intel hidden-function selector: %d\n",
+				cleanup_ret);
+		else
+			ret = cleanup_ret;
+	}
+	return ret;
 }
 
 /* ----- Intel BIOS Data/Feature mask helpers ----- */
@@ -1652,6 +1683,7 @@ static int it87_h2_init(struct it87_h2ram_handle *h)
 			ret = pci_enable_device(h->bridge);
 			pci_dev_put(pdev);
 			if (ret) {
+				pci_dev_put(h->bridge);
 				h->bridge = NULL;
 				return ret;
 			}
@@ -1665,10 +1697,12 @@ static int it87_h2_init(struct it87_h2ram_handle *h)
 	     */
 			if (h->is_intel) {
 				int hret = it87_intel_init_hidden(h);
-				if (hret < 0) {
-					/* Ensure a clean generic state on failure */
-					h->hidden_ready = false;
-					h->hidden_base = 0;
+				if (hret) {
+					pci_disable_device(h->bridge);
+					pci_dev_put(h->bridge);
+					h->bridge = NULL;
+					return hret < 0 ? hret :
+						it87_pcibios_err_to_errno(hret);
 				}
 			}
 			_save_regs(h);
@@ -1734,6 +1768,7 @@ static void it87_h2_release(struct it87_h2ram_handle *h)
 {
 	if (!h || !h->bridge)return;
 	_restore_regs(h);
+	pci_disable_device(h->bridge);
 	pci_dev_put(h->bridge);
 	h->bridge = NULL;
 }
