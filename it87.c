@@ -1314,11 +1314,13 @@ struct it87_h2ram_handle
 	u32 rd8[2];
 	u32 r98[2];
 	bool have[2];
+	bool slots_valid;
 
 	u32 hidden_base;   		/* hidden base address for z390/skylake bridges */
 	bool hidden_ready;       /* hidden window ready/available */
 	/* AMD/Intel: track currently programmed base to minimize churn */
 	u32 current_base;
+	int current_slot;
 };
 
 /* Global MMIO bridge state tracking */
@@ -1584,6 +1586,7 @@ static int _restore_regs(struct it87_h2ram_handle *h)
 		if (ret)
 			return ret;
 		h->current_base = 0;
+		h->current_slot = -1;
 		ret = pci_reg_write(h->bridge, 0x60, h->or60);
 		if (ret)
 			return ret;
@@ -1602,6 +1605,7 @@ static int _restore_regs(struct it87_h2ram_handle *h)
 		}
 		ret = pci_reg_write(h->bridge, 0x98, h->or98 & ~BIT(0));
 		h->current_base = 0;
+		h->current_slot = -1;
 		if (ret)
 			goto unmap;
 		if (hb)
@@ -1659,6 +1663,7 @@ unmap:
 		 goto restore;
 
 	 h->current_base = h->base[idx];
+	 h->current_slot = idx;
 	 return 0;
 
 restore:
@@ -1681,7 +1686,7 @@ static int _intel_enable_slot(struct it87_h2ram_handle *h, int idx)
 	if (idx < 0 || idx > 1) return -EINVAL;
 	if (!h->have[idx]) return -EINVAL;
 
-	if (h->current_base == h->base[idx])
+	if (h->current_slot == idx && h->current_base == h->base[idx])
 		return 0; /* already active */
 
 	/* Hidden-window mirror first if available */
@@ -1710,6 +1715,7 @@ static int _intel_enable_slot(struct it87_h2ram_handle *h, int idx)
 		iounmap(hb);
 
 	h->current_base = h->base[idx];
+	h->current_slot = idx;
 	return 0;
 
 restore:
@@ -1740,6 +1746,7 @@ static int it87_h2_init(struct it87_h2ram_handle *h)
 		return -EINVAL;
 
 	memset(h, 0, sizeof(*h));
+	h->current_slot = -1;
 
 	pdev = pci_get_class((PCI_CLASS_BRIDGE_ISA << 8), NULL);
 	while (pdev) {
@@ -1787,25 +1794,15 @@ static int it87_h2_init(struct it87_h2ram_handle *h)
 	return -ENODEV;
 }
 
-/* Set up MMIO bridge register values */
-static int it87_h2_set_slot(struct it87_h2ram_handle *h, int idx, u64 mmio_base)
+static int it87_h2_prepare_slot_regs(struct it87_h2ram_handle *h, int idx)
 {
-	u32 base32;
-
-	if (!h || !h->bridge)return -ENODEV;
-	if (idx<0 || idx>1)return -EINVAL;
-	if (mmio_base==0)return -EINVAL;
-	if (mmio_base > 0xFFFFFFFFull)return -ERANGE;
-
-	base32 = (u32)mmio_base;
-	base32 &= ~0xFFFFu;                        /* 64KiB align down */
-
-	h->base[idx]  = base32;
-	h->have[idx]  = true;
+	u32 base32 = h->base[idx];
 
 	/* If bridge is amd calculate the register values for the bridge window of idx */
 	if (h->bridge->vendor == IT87_H2_VENDOR_AMD) {
 		if (idx == 1) {
+			if ((base32 >> 16) == 0xffffu)
+				return -ERANGE;
 			h->r48[idx] = (h->or48 & ~BIT(5)) | BIT(5);
 			h->r60[idx] = ((((base32 >> 16) & 0xFFFFu) + 1u) << 16) | ((base32 >> 16) & 0xFFFFu);
 			h->r6c[idx] = (h->or6c & 0xFFFF0000u) | (((base32 >> 16) & 0xFFFFu) + 1u);
@@ -1816,23 +1813,82 @@ static int it87_h2_set_slot(struct it87_h2ram_handle *h, int idx, u64 mmio_base)
 		}
 	/* If bridge is intel calculate the register values for the bridge window of idx */
 	} else if (h->bridge->vendor == IT87_H2_VENDOR_INTEL) {
-			u16 mask = _intel_bios_mask_for_data_space(base32);
-			if (!mask) mask = _intel_bios_mask_for_feat_space(base32);
-			h->r98[idx] = ((base32 >> 16) << 16) | 1u;   /* Generic Memory Range */
-			h->rd8[idx] = h->ord8 & ~(u32)mask;        /* active-low: clear mask bits */
+		u16 mask;
+
+		if (idx == 0) {
+			mask = BIT(0);
+		} else {
+			mask = _intel_bios_mask_for_data_space(base32);
+			if (!mask)
+				mask = _intel_bios_mask_for_feat_space(base32);
+			if (!mask)
+				return -ERANGE;
 		}
+		h->r98[idx] = ((base32 >> 16) << 16) | 1u;
+		h->rd8[idx] = h->ord8 & ~(u32)mask;
+	} else {
+		return -ENODEV;
+	}
 
 	return 0;
+}
+
+static int it87_h2_prepare_all_slots(struct it87_h2ram_handle *h)
+{
+	int i, ret;
+
+	h->slots_valid = false;
+	for (i = 0; i < ARRAY_SIZE(h->have); i++) {
+		if (!h->have[i])
+			continue;
+		ret = it87_h2_prepare_slot_regs(h, i);
+		if (ret)
+			return ret;
+	}
+	h->slots_valid = true;
+	return 0;
+}
+
+/* Set up MMIO bridge register values */
+static int it87_h2_set_slot(struct it87_h2ram_handle *h, int idx, u64 mmio_base)
+{
+	bool old_have;
+	int ret;
+	u32 base32, old_base;
+
+	if (!h || !h->bridge)return -ENODEV;
+	if (idx<0 || idx>1)return -EINVAL;
+	if (mmio_base==0)return -EINVAL;
+	if (mmio_base > 0xFFFFFFFFull)return -ERANGE;
+
+	base32 = (u32)mmio_base;
+	base32 &= ~0xFFFFu;                        /* 64KiB align down */
+	if (!base32)
+		return -ERANGE;
+
+	old_base = h->base[idx];
+	old_have = h->have[idx];
+	h->base[idx] = base32;
+	h->have[idx] = true;
+
+	ret = it87_h2_prepare_all_slots(h);
+	if (ret) {
+		h->base[idx] = old_base;
+		h->have[idx] = old_have;
+		it87_h2_prepare_all_slots(h);
+	}
+	return ret;
 }
 
 static int it87_h2_use_slot(struct it87_h2ram_handle *h, int idx)
 {
 	if (!h || !h->bridge)return -ENODEV;
 	if (idx<0 || idx>1)return -EINVAL;
+	if (!h->saved || !h->slots_valid)return -EIO;
 	if (!h->have[idx])return -ENOENT;
 
 	/* Program window on demand for all vendors */
-	if (h->current_base != h->base[idx]) {
+	if (h->current_slot != idx || h->current_base != h->base[idx]) {
 		return _enable_slot(h, idx);
 	}
 	return 0;
@@ -1866,10 +1922,16 @@ static int it87_h2_global_init(void)
 static int it87_h2_global_set_slot(int idx, u64 mmio_base)
 {
 	int ret;
+
+	mutex_lock(&mmio_lock);
 	if (!it87_h2_global_ready) {
-		return -ENODEV;
+		ret = -ENODEV;
+		goto unlock;
 	}
 	ret = it87_h2_set_slot(&it87_h2_global, idx, mmio_base);
+
+unlock:
+	mutex_unlock(&mmio_lock);
 	return ret;
 }
 
