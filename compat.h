@@ -96,6 +96,7 @@ u8 vid_which_vrm(void)
 	SIMPLE_DEV_PM_OPS(name, suspend_fn, resume_fn)
 
 static void __maybe_unused it87_resume_sio(struct platform_device *pdev);
+static int __maybe_unused it87_suspend(struct device *dev);
 static int __maybe_unused it87_resume(struct device *dev);
 #endif
 

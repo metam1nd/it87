@@ -1950,6 +1950,37 @@ static int it87_h2_global_activate_slot(int idx)
 	return ret;
 }
 
+static int it87_h2_global_prepare_resume(int idx)
+{
+	int ret = 0;
+
+	mutex_lock(&mmio_lock);
+	if (!it87_h2_global_ready) {
+		ret = -ENODEV;
+		goto unlock;
+	}
+
+	if (!it87_h2_global.saved) {
+		ret = _save_regs(&it87_h2_global);
+		if (ret)
+			goto unlock;
+	}
+
+	if (!it87_h2_global.slots_valid) {
+		ret = it87_h2_prepare_all_slots(&it87_h2_global);
+		if (ret)
+			goto unlock;
+	}
+
+	it87_h2_global.current_base = 0;
+	it87_h2_global.current_slot = -1;
+	ret = it87_h2_use_slot(&it87_h2_global, idx);
+
+unlock:
+	mutex_unlock(&mmio_lock);
+	return ret;
+}
+
 /* Ensure a specific slot is active (AMD may reprogram bridge) */
 static int it87_h2_global_use_slot(int idx)
 {
@@ -5963,25 +5994,93 @@ static void it87_resume_sio(struct platform_device *pdev)
 	superio_exit(data->sioaddr, has_noconf(data));
 }
 
+static int it87_suspend(struct device *dev)
+{
+	struct it87_data *data = dev_get_drvdata(dev);
+	int err = 0;
+
+	if (data) {
+		mutex_lock(&data->update_lock);
+		data->pwm_writable = false;
+		mutex_unlock(&data->update_lock);
+	}
+
+	if (data && (data->mmio_bridge || data->mmio_h2ram)) {
+		mutex_lock(&mmio_lock);
+		err = _restore_regs(&it87_h2_global);
+		if (!err) {
+			it87_h2_global.saved = false;
+			it87_h2_global.slots_valid = false;
+			it87_h2_global.current_base = 0;
+			it87_h2_global.current_slot = -1;
+		}
+		mutex_unlock(&mmio_lock);
+	}
+	if (err && data) {
+		int slot = data->sioaddr == REG_4E ? 1 : 0;
+		int recovery_err;
+
+		recovery_err = it87_h2_global_prepare_resume(slot);
+		if (recovery_err) {
+			dev_err(dev, "Unable to reactivate MMIO bridge after failed suspend: %d\n",
+				 recovery_err);
+			return err;
+		}
+
+		recovery_err = it87_lock(data);
+
+		if (recovery_err) {
+			dev_err(dev, "Unable to restore PWM access after failed suspend: %d\n",
+				recovery_err);
+		} else {
+			WRITE_ONCE(data->bridge_error, 0);
+			data->pwm_writable = data->has_pwm && it87_check_pwm(dev) &&
+				!READ_ONCE(data->bridge_error);
+			recovery_err = READ_ONCE(data->bridge_error);
+			if (recovery_err)
+				dev_err(dev, "ISA bridge access failed after aborted suspend: %d\n",
+					recovery_err);
+			else if (data->has_pwm && !data->pwm_writable)
+				dev_warn(dev, "PWM safety validation failed after aborted suspend; writes remain disabled\n");
+			it87_unlock(data);
+		}
+	}
+
+	return err;
+}
+
 static int it87_resume(struct device *dev)
 {
 	struct platform_device *pdev = to_platform_device(dev);
 	struct it87_data *data = dev_get_drvdata(dev);
 	int err;
 
+	if (data->mmio_bridge || data->mmio_h2ram) {
+		int slot = data->sioaddr == REG_4E ? 1 : 0;
+
+		err = it87_h2_global_prepare_resume(slot);
+		if (err)
+			return err;
+	}
+
 	it87_resume_sio(pdev);
 
 	err = it87_lock(data);
 	if (err)
 		return err;
+	WRITE_ONCE(data->bridge_error, 0);
 
-	it87_check_pwm(dev);
+	data->pwm_writable = data->has_pwm && it87_check_pwm(dev) &&
+		!READ_ONCE(data->bridge_error);
+	if (data->has_pwm && !data->pwm_writable)
+		dev_warn(dev, "PWM safety validation failed after resume; writes remain disabled\n");
 	it87_check_limit_regs(data);
 	it87_check_voltage_monitors_reset(data);
 	it87_check_tachometers_reset(pdev);
 	it87_check_tachometers_16bit_mode(pdev);
 
-	if (data->mmio_h2ram || data->ecio_h2ram) {
+	if (data->pwm_writable &&
+	    (data->mmio_h2ram || data->ecio_h2ram)) {
 		it87_update_smartfan_global(data);
 	}
 
@@ -5989,15 +6088,28 @@ static int it87_resume(struct device *dev)
 
 	/* force update */
 	data->valid = false;
+	err = READ_ONCE(data->bridge_error);
+	if (err) {
+		data->pwm_writable = false;
+		dev_err(dev, "ISA bridge access failed during resume: %d\n", err);
+	}
 
 	it87_unlock(data);
+	if (err)
+		return err;
 
 	it87_update_device(dev);
+	err = READ_ONCE(data->bridge_error);
+	if (err) {
+		WRITE_ONCE(data->pwm_writable, false);
+		dev_err(dev, "ISA bridge access failed after resume: %d\n", err);
+		return err;
+	}
 
 	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(it87_dev_pm_ops, NULL, it87_resume);
+static DEFINE_SIMPLE_DEV_PM_OPS(it87_dev_pm_ops, it87_suspend, it87_resume);
 
 static struct platform_driver it87_driver = {
 	.driver = {
@@ -6087,6 +6199,15 @@ static int __init it87_device_add(int index, unsigned short sio_address,
 	pdev = platform_device_alloc(DRVNAME, sio_address);
 	if (!pdev)
 		return -ENOMEM;
+	if (mmio_address &&
+	    (sio_data->mmio_bridge || sio_data->mmio_h2ram)) {
+		if (!it87_h2_global_ready || !it87_h2_global.bridge) {
+			err = -ENODEV;
+			goto exit_device_put;
+		}
+		/* Keep bridge PM ordered before its platform consumer. */
+		pdev->dev.parent = &it87_h2_global.bridge->dev;
+	}
 
 	err = platform_device_add_resources(pdev, res, nres);
 	if (err)
