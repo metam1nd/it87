@@ -1020,6 +1020,7 @@ struct it87_data {
 	bool mmio_bridge;   /* ISA bridge MMIO without hybrid Access */
 	bool mmio_h2ram;    /* ISA bridge MMIO with hybrid access */
 	bool ecio_h2ram;    /* Extended ECIO ports with hybrid access. */
+	int bridge_error;   /* Latched ISA bridge programming error */
 
 	int (*read)(struct it87_data *, u16);
 	void (*write)(struct it87_data *, u16, u8);
@@ -1075,6 +1076,7 @@ struct it87_data {
 	 * simple.
 	 */
 	u8 has_pwm;		/* Bitfield, pwm control enabled */
+	bool pwm_writable;	/* PWM register configuration passed safety checks */
 	u8 pwm_ctrl[NUM_PWM];	/* Register value */
 	u8 pwm_duty[NUM_PWM];	/* Manual PWM value set by user */
 	u8 pwm_temp_map[NUM_PWM];/* PWM to temp. chan. mapping (bits 1-0) */
@@ -2478,21 +2480,33 @@ static void it87_mmio_write(struct it87_data *data, u16 reg, u8 value)
 	writeb(value, data->mmio + reg);
 }
 
+static void it87_bridge_record_error(struct it87_data *data, int err)
+{
+	if (!err)
+		return;
+	cmpxchg(&data->bridge_error, 0, err);
+	WRITE_ONCE(data->pwm_writable, false);
+}
+
 /* ISA bridge MMIO accessors */
 static int it87_bridge_read(struct it87_data *data, u16 reg)
 {
 	if (data->mmio &&
 		!(data->features & FEAT_MMIO) &&
-		it87_h2_global_ready &&
 		(data->mmio_bridge || data->mmio_h2ram)) {
+		int err;
 		int slot = (data->sioaddr==REG_4E) ? 1 : 0;
 		int val = 0;
 
 		mutex_lock(&mmio_lock);
-
-		if (!it87_h2_global_use_slot(slot)) {
+		if (!it87_h2_global_ready)
+			err = -ENODEV;
+		else
+			err = it87_h2_global_use_slot(slot);
+		if (err)
+			it87_bridge_record_error(data, err);
+		else
 			val = it87_mmio_read(data, reg);
-		}
 		mutex_unlock(&mmio_lock);
 		return val;
 	}
@@ -2501,19 +2515,23 @@ static int it87_bridge_read(struct it87_data *data, u16 reg)
 
 static void it87_bridge_write(struct it87_data *data, u16 reg, u8 value)
 {
+	if (READ_ONCE(data->bridge_error))
+		return;
 	if (data->mmio &&
 		!(data->features & FEAT_MMIO) &&
-		it87_h2_global_ready &&
 		(data->mmio_bridge || data->mmio_h2ram)) {
+		int err;
 		int slot = (data->sioaddr==REG_4E) ? 1 : 0;
 
 		mutex_lock(&mmio_lock);
-
-		if (it87_h2_global_use_slot(slot)) {
-			mutex_unlock(&mmio_lock);
-			return;
-		}
-		it87_mmio_write(data, reg, value);
+		if (!it87_h2_global_ready)
+			err = -ENODEV;
+		else
+			err = it87_h2_global_use_slot(slot);
+		if (err)
+			it87_bridge_record_error(data, err);
+		else
+			it87_mmio_write(data, reg, value);
 		mutex_unlock(&mmio_lock);
 	}
 }
@@ -2633,6 +2651,39 @@ static void it87_unlock(struct it87_data *data)
 {
 	smbus_enable(data);
 	mutex_unlock(&data->update_lock);
+}
+
+static int it87_pwm_lock(struct it87_data *data)
+{
+	int err;
+
+	err = READ_ONCE(data->bridge_error);
+	if (err)
+		return err;
+	if (!READ_ONCE(data->pwm_writable))
+		return -EIO;
+	err = it87_lock(data);
+	if (err)
+		return err;
+	err = READ_ONCE(data->bridge_error);
+	if (err || !data->pwm_writable) {
+		data->pwm_writable = false;
+		it87_unlock(data);
+		return err ? err : -EIO;
+	}
+	return 0;
+}
+
+static ssize_t it87_pwm_finish(struct it87_data *data, ssize_t result)
+{
+	int err = READ_ONCE(data->bridge_error);
+
+	if (err) {
+		data->pwm_writable = false;
+		result = err;
+	}
+	it87_unlock(data);
+	return result;
 }
 
 static struct it87_data *it87_update_device(struct device *dev)
@@ -3382,17 +3433,16 @@ static ssize_t set_pwm_enable(struct device *dev, struct device_attribute *attr,
 	if (kstrtol(buf, 10, &val) < 0 || val < 0 || val > 2)
 		return -EINVAL;
 
-	/* Check trip points before switching to automatic mode */
-	if (val == 2) {
-		if (check_trip_points(dev, nr) < 0)
-			return -EINVAL;
-	}
-
-	err = it87_lock(data);
+	err = it87_pwm_lock(data);
 	if (err)
 		return err;
 
 	it87_update_pwm_ctrl(data, nr);
+
+	/* Check trip points before switching to automatic mode. */
+	if (val == 2 && check_trip_points(dev, nr) < 0) {
+		return it87_pwm_finish(data, -EINVAL);
+	}
 
 	if (val == 0) {
 		if (nr < 3 && has_fanctl_onoff(data)) {
@@ -3451,8 +3501,7 @@ static ssize_t set_pwm_enable(struct device *dev, struct device_attribute *attr,
 		it87_update_smartfan_global(data);
 	}
 
-	it87_unlock(data);
-	return count;
+	return it87_pwm_finish(data, count);
 }
 
 static ssize_t set_pwm(struct device *dev, struct device_attribute *attr,
@@ -3467,7 +3516,7 @@ static ssize_t set_pwm(struct device *dev, struct device_attribute *attr,
 	if (kstrtol(buf, 10, &val) < 0 || val < 0 || val > 255)
 		return -EINVAL;
 
-	err = it87_lock(data);
+	err = it87_pwm_lock(data);
 	if (err)
 		return err;
 
@@ -3497,8 +3546,7 @@ static ssize_t set_pwm(struct device *dev, struct device_attribute *attr,
 		}
 	}
 unlock:
-	it87_unlock(data);
-	return count;
+	return it87_pwm_finish(data, count);
 }
 
 static ssize_t set_pwm_freq(struct device *dev, struct device_attribute *attr,
@@ -3523,7 +3571,7 @@ static ssize_t set_pwm_freq(struct device *dev, struct device_attribute *attr,
 			break;
 	}
 
-	err = it87_lock(data);
+	err = it87_pwm_lock(data);
 	if (err)
 		return err;
 
@@ -3536,8 +3584,7 @@ static ssize_t set_pwm_freq(struct device *dev, struct device_attribute *attr,
 		data->extra |= i << 4;
 		data->write(data, IT87_REG_TEMP_EXTRA, data->extra);
 	}
-	it87_unlock(data);
-	return count;
+	return it87_pwm_finish(data, count);
 }
 
 static ssize_t show_pwm_temp_map(struct device *dev,
@@ -3572,7 +3619,7 @@ static ssize_t set_pwm_temp_map(struct device *dev,
 
 	map = val - 1;
 
-	err = it87_lock(data);
+	err = it87_pwm_lock(data);
 	if (err)
 		return err;
 
@@ -3586,8 +3633,7 @@ static ssize_t set_pwm_temp_map(struct device *dev,
 		data->pwm_ctrl[nr] = temp_map_to_reg(data, nr, map);
 		data->write(data, data->REG_PWM[nr], data->pwm_ctrl[nr]);
 	}
-	it87_unlock(data);
-	return count;
+	return it87_pwm_finish(data, count);
 }
 
 static ssize_t show_auto_pwm(struct device *dev, struct device_attribute *attr,
@@ -3621,7 +3667,7 @@ static ssize_t set_auto_pwm(struct device *dev, struct device_attribute *attr,
 	if (kstrtol(buf, 10, &val) < 0 || val < 0 || val > 255)
 		return -EINVAL;
 
-	err = it87_lock(data);
+	err = it87_pwm_lock(data);
 	if (err)
 		return err;
 
@@ -3631,8 +3677,7 @@ static ssize_t set_auto_pwm(struct device *dev, struct device_attribute *attr,
 	else
 		regaddr = IT87_REG_AUTO_PWM(nr, point);
 	data->write(data, regaddr, data->auto_pwm[nr][point]);
-	it87_unlock(data);
-	return count;
+	return it87_pwm_finish(data, count);
 }
 
 static ssize_t show_auto_pwm_slope(struct device *dev,
@@ -3661,14 +3706,13 @@ static ssize_t set_auto_pwm_slope(struct device *dev,
 	if (kstrtoul(buf, 10, &val) < 0 || val > 127)
 		return -EINVAL;
 
-	err = it87_lock(data);
+	err = it87_pwm_lock(data);
 	if (err)
 		return err;
 
 	data->auto_pwm[nr][1] = (data->auto_pwm[nr][1] & 0x80) | val;
 	data->write(data, IT87_REG_AUTO_TEMP(nr, 4), data->auto_pwm[nr][1]);
-	it87_unlock(data);
-	return count;
+	return it87_pwm_finish(data, count);
 }
 
 static ssize_t show_auto_temp(struct device *dev, struct device_attribute *attr,
@@ -3707,7 +3751,7 @@ static ssize_t set_auto_temp(struct device *dev, struct device_attribute *attr,
 	if (kstrtol(buf, 10, &val) < 0 || val < -128000 || val > 127000)
 		return -EINVAL;
 
-	err = it87_lock(data);
+	err = it87_pwm_lock(data);
 	if (err)
 		return err;
 
@@ -3723,8 +3767,7 @@ static ssize_t set_auto_temp(struct device *dev, struct device_attribute *attr,
 			point--;
 		data->write(data, IT87_REG_AUTO_TEMP(nr, point), reg);
 	}
-	it87_unlock(data);
-	return count;
+	return it87_pwm_finish(data, count);
 }
 
 static SENSOR_DEVICE_ATTR_2(fan1_input, S_IRUGO, show_fan, NULL, 0, 0);
@@ -5767,6 +5810,7 @@ static int it87_probe(struct platform_device *pdev)
 				slot, err);
 			return err;
 		}
+		WRITE_ONCE(data->bridge_error, 0);
 	}
 
 	/* Disable SMBus shadowing while probing sensor blocks */
@@ -5782,8 +5826,8 @@ static int it87_probe(struct platform_device *pdev)
 	}
 
 	enable_pwm_interface = it87_check_pwm(dev);
-	if (!enable_pwm_interface)
-		dev_info(dev, "Detected broken BIOS defaults, disabling PWM interface\n");
+	data->pwm_writable = enable_pwm_interface &&
+		!READ_ONCE(data->bridge_error);
 
 	if (has_scaling(data))
 	{
@@ -5851,6 +5895,13 @@ static int it87_probe(struct platform_device *pdev)
 	it87_init_device(pdev);
 
 	smbus_enable(data);
+	if (READ_ONCE(data->bridge_error)) {
+		enable_pwm_interface = 0;
+		data->pwm_writable = false;
+		dev_err(dev, "ISA bridge access failed, disabling PWM interface\n");
+	} else if (!enable_pwm_interface) {
+		dev_info(dev, "Detected broken BIOS defaults, disabling PWM interface\n");
+	}
 
 	if (!sio_data->skip_vid)
 	{

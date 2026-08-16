@@ -72,6 +72,22 @@ u8 vid_which_vrm(void)
 #define kobj_to_dev(kobj)	container_of(kobj, struct device, kobj)
 #endif
 
+#ifndef READ_ONCE
+#ifdef ACCESS_ONCE
+#define READ_ONCE(x)	ACCESS_ONCE(x)
+#else
+#define READ_ONCE(x)	(*(volatile typeof(x) *)&(x))
+#endif
+#endif
+
+#ifndef WRITE_ONCE
+#ifdef ACCESS_ONCE
+#define WRITE_ONCE(x, val)	(ACCESS_ONCE(x) = (val))
+#else
+#define WRITE_ONCE(x, val)	(*(volatile typeof(x) *)&(x) = (val))
+#endif
+#endif
+
 #ifndef DEFINE_SIMPLE_DEV_PM_OPS
 /*
  * New API in 5.17
