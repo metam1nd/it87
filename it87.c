@@ -1129,6 +1129,7 @@ struct it87_data {
 	u8 pwm_override_mode[NUM_PWM];
 	u8 pwm_override_duty[NUM_PWM];
 	bool suspend_defaults_restored;
+	bool probe_complete;
 
 	int (*read)(struct it87_data *, u16);
 	void (*write)(struct it87_data *, u16, u8);
@@ -2156,7 +2157,7 @@ static int it87_h2_global_init(void)
 	return ret;
 }
 
-/* Configure a slot (just updates state, does not touch PCI yet) */
+/* Prepare a slot; activation is deferred until the resource-backed probe. */
 static int it87_h2_global_set_slot(int idx, u64 mmio_base)
 {
 	int ret;
@@ -2169,6 +2170,32 @@ static int it87_h2_global_set_slot(int idx, u64 mmio_base)
 	mutex_unlock(&mmio_lock);
 
 	return ret;
+}
+
+static int it87_h2_global_activate_slot(int idx)
+{
+	int ret;
+
+	mutex_lock(&mmio_lock);
+	if (!it87_h2_global_ready)
+		ret = -ENODEV;
+	else
+		ret = it87_h2_use_slot(&it87_h2_global, idx);
+	mutex_unlock(&mmio_lock);
+
+	return ret;
+}
+
+static struct device *it87_h2_global_parent(void)
+{
+	struct device *parent = NULL;
+
+	mutex_lock(&mmio_lock);
+	if (it87_h2_global_ready && it87_h2_global.bridge)
+		parent = &it87_h2_global.bridge->dev;
+	mutex_unlock(&mmio_lock);
+
+	return parent;
 }
 
 /* Ensure a specific slot is active (AMD may reprogram bridge) */
@@ -6819,6 +6846,23 @@ static int it87_probe(struct platform_device *pdev)
 	/* Initialize register accessors (select IO vs MMIO backend) */
 	it87_init_regs(pdev);
 
+	/*
+	 * The child MMIO resource is claimed and mapped above.  Activate its
+	 * validated forwarding slot before any controller register is probed.
+	 * This is explicit even for hybrid H2RAM, whose first accesses may use
+	 * conventional I/O rather than the bridge window.
+	 */
+	if (data->mmio_bridge || data->mmio_h2ram) {
+		int slot = data->sioaddr == REG_4E ? 1 : 0;
+
+		err = it87_h2_global_activate_slot(slot);
+		if (err) {
+			dev_err(dev, "Failed to activate ISA bridge slot %d: %d\n",
+				slot, err);
+			return err;
+		}
+	}
+
 	/* Disable SMBus shadowing while probing sensor blocks */
 	err = smbus_disable(data);
 	if (err)
@@ -6949,7 +6993,11 @@ static int it87_probe(struct platform_device *pdev)
 	hwmon_dev = devm_hwmon_device_register_with_groups(dev,
 			     it87_devices[sio_data->type].name,
 			     data, data->groups);
-	return PTR_ERR_OR_ZERO(hwmon_dev);
+	if (IS_ERR(hwmon_dev))
+		return PTR_ERR(hwmon_dev);
+
+	data->probe_complete = true;
+	return 0;
 }
 
 static void it87_resume_sio(struct platform_device *pdev)
@@ -7057,9 +7105,24 @@ static struct platform_driver it87_driver = {
 	.driver = {
 		.name	= DRVNAME,
 		.pm	= pm_sleep_ptr(&it87_dev_pm_ops),
+		.probe_type = PROBE_FORCE_SYNCHRONOUS,
 	},
 	.probe	= it87_probe,
 };
+
+static bool it87_probe_completed(struct platform_device *pdev)
+{
+	struct it87_data *data;
+	bool complete;
+
+	device_lock(&pdev->dev);
+	data = platform_get_drvdata(pdev);
+	complete = pdev->dev.driver == &it87_driver.driver && data &&
+		   data->probe_complete;
+	device_unlock(&pdev->dev);
+
+	return complete;
+}
 
 static int __init it87_device_add(int index, unsigned short sio_address,
 				  phys_addr_t mmio_address,
@@ -7123,8 +7186,16 @@ static int __init it87_device_add(int index, unsigned short sio_address,
 		phys_addr_t start = mmio_address;
 		phys_addr_t end   = mmio_address + MMIO_HI_BOUND; /* 0x000–0x3FF */
 
-		/* H2RAM chips have an extra EC/HWM block mapped into the window
-	 * at base+0x900..base+0xCFF instead of base+0x000..base+0x3FF. */
+		/*
+		 * The chipset's 64 KiB decode is a forwarding aperture, not
+		 * exclusive IT87 ownership.  Reserve only the IT87 register
+		 * subrange modeled by this child.
+		 */
+
+		/*
+		 * H2RAM chips have an extra EC/HWM block mapped into the window
+		 * at base+0x900..base+0xCFF instead of base+0x000..base+0x3FF.
+		 */
 		if (sio_data->mmio_h2ram)
 		{
 			start = mmio_address;
@@ -7141,6 +7212,14 @@ static int __init it87_device_add(int index, unsigned short sio_address,
 	pdev = platform_device_alloc(DRVNAME, sio_address);
 	if (!pdev)
 		return -ENOMEM;
+
+	if (sio_data->mmio_bridge || sio_data->mmio_h2ram) {
+		pdev->dev.parent = it87_h2_global_parent();
+		if (!pdev->dev.parent) {
+			err = -ENODEV;
+			goto exit_device_put;
+		}
+	}
 
 	err = platform_device_add_resources(pdev, res, nres);
 	if (err)
@@ -7163,10 +7242,19 @@ static int __init it87_device_add(int index, unsigned short sio_address,
 		pr_err("Device addition failed (%d)\n", err);
 		goto exit_device_put;
 	}
+	/* Never retain an unbound, incompletely validated device. */
+	if (!it87_probe_completed(pdev)) {
+		pr_err("Device probe failed for Super I/O at %#x\n",
+		       sio_address);
+		err = -ENODEV;
+		goto exit_device_del;
+	}
 
 	it87_pdev[index] = pdev;
 	return 0;
 
+exit_device_del:
+	platform_device_del(pdev);
 exit_device_put:
 	platform_device_put(pdev);
 	return err;
@@ -7384,29 +7472,41 @@ static int __init sm_it87_init(void)
 	 * the ISA bridge window (mmio_bridge / mmio_h2ram), configure
 	 * the global H2 manager slot for it.
 	 */
-		if (mmio_address &&
-	   (sio_data.mmio_bridge || sio_data.mmio_h2ram)) {
+		if (sio_data.mmio_bridge || sio_data.mmio_h2ram) {
 			phys_addr_t base = mmio_address;
 			int         slot;
 			int         ret;
 
+			if (!base) {
+				pr_err("Bridge-backed device at Super I/O %#x has no MMIO base\n",
+				       sioaddr[i]);
+				err = -EINVAL;
+				goto exit_unregister;
+			}
+
 			if (!it87_h2_global_inited) {
 				ret = it87_h2_global_init();
 				if (ret) {
-					pr_debug("H2RAM global bridge init failed: %d\n",
-			     ret);
-				} else {
-					it87_h2_global_inited = true;
+					pr_err("ISA bridge initialization failed: %d\n",
+					       ret);
+					err = ret;
+					goto exit_unregister;
 				}
+				it87_h2_global_inited = true;
 			}
-			if (it87_h2_global_ready) {
-				/* slot 0 = 0x2E, slot 1 = 0x4E */
-				slot = (sioaddr[i]==REG_4E) ? 1 : 0;
-				ret = it87_h2_global_set_slot(slot, base);
-				if (ret) {
-					pr_debug("H2RAM set_slot(%d,%pa) failed: %d\n",
-			     slot, &base, ret);
-				}
+			if (!it87_h2_global_ready) {
+				err = -ENODEV;
+				goto exit_unregister;
+			}
+
+			/* slot 0 = 0x2E, slot 1 = 0x4E */
+			slot = sioaddr[i] == REG_4E ? 1 : 0;
+			ret = it87_h2_global_set_slot(slot, base);
+			if (ret) {
+				pr_err("ISA bridge slot %d validation failed for %pa: %d\n",
+				       slot, &base, ret);
+				err = ret;
+				goto exit_unregister;
 			}
 		}
 
@@ -7423,6 +7523,7 @@ static int __init sm_it87_init(void)
 	return 0;
 
 exit_unregister:
+	/* Child devres restores firmware fan state before bridge release. */
 	if (it87_pdev[1]) {
 		platform_device_unregister(it87_pdev[1]);
 		it87_pdev[1] = NULL;
@@ -7439,6 +7540,7 @@ exit_unregister:
 }
 
 static void __exit sm_it87_exit(void) {
+	/* Unregister children before restoring and releasing the shared bridge. */
 	if (it87_pdev[1]) {
 		platform_device_unregister(it87_pdev[1]);
 		it87_pdev[1] = NULL;
