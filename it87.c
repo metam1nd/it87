@@ -1130,6 +1130,7 @@ struct it87_data {
 	u8 pwm_override_mode[NUM_PWM];
 	u8 pwm_override_duty[NUM_PWM];
 	bool suspend_defaults_restored;
+	bool probe_complete;
 
 	int (*read)(struct it87_data *, u16);
 	void (*write)(struct it87_data *, u16, u8);
@@ -2200,13 +2201,14 @@ static int it87_h2_global_activate_slot(int idx)
 	int ret;
 
 	mutex_lock(&mmio_lock);
-	if (!it87_h2_global_ready)
+	ret = atomic_read(&it87_h2_global_error);
+	if (!ret && !it87_h2_global_ready)
 		ret = -ENODEV;
-	else
+	if (!ret)
 		ret = it87_h2_use_slot(&it87_h2_global, idx);
-	mutex_unlock(&mmio_lock);
 	if (ret)
 		ret = it87_h2_latch_error(idx, ret);
+	mutex_unlock(&mmio_lock);
 
 	return ret;
 }
@@ -3284,8 +3286,8 @@ static void it87_restore_extra_vectors(struct it87_data *data, int nr,
 }
 
 /* Put active software-owned channels back on their exact firmware snapshots. */
-static void it87_restore_overrides_to_firmware(struct it87_data *data,
-						 bool release)
+static int it87_restore_overrides_to_firmware(struct it87_data *data,
+						bool release)
 {
 	u8 mask = data->pwm_override_mask;
 	int i;
@@ -3306,21 +3308,32 @@ static void it87_restore_overrides_to_firmware(struct it87_data *data,
 	it87_h2ram_restore_global_snapshot(data, release);
 	if (release && !it87_bridge_fault(data))
 		data->pwm_override_mask = 0;
+
+	return it87_bridge_fault(data);
 }
 
 /* Re-assert the exact software override after a successful system resume. */
-static void it87_reapply_overrides(struct it87_data *data)
+static int it87_reapply_overrides(struct it87_data *data)
 {
 	u8 mask = data->pwm_override_mask;
+	int err;
 	int i;
 
 	if (!mask)
-		return;
+		return 0;
+
+	err = it87_bridge_fault(data);
+	if (err)
+		return err;
 
 	/* G2/G3 must have SmartFan active while their flattened vectors are used. */
 	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G2 ||
-	    data->h2ram_sf_gen == IT87_H2RAM_SF_G3)
+	    data->h2ram_sf_gen == IT87_H2RAM_SF_G3) {
 		it87_h2ram_take_control(data);
+		err = it87_bridge_fault(data);
+		if (err)
+			return err;
+	}
 
 	for (i = 0; i < NUM_PWM; i++) {
 		if (!(mask & BIT(i)))
@@ -3328,19 +3341,34 @@ static void it87_reapply_overrides(struct it87_data *data)
 
 		if (it87_uses_h2ram_vectors(data, i)) {
 			it87_h2ram_set_manual(data, i, data->pwm_override_duty[i]);
+			err = it87_bridge_fault(data);
+			if (err)
+				return err;
 			data->h2ram_pwm_mode[i] = data->pwm_override_mode[i];
 		} else if (it87_uses_conventional_override(data, i)) {
 			it87_apply_conventional_override(data, i,
 						 data->pwm_override_mode[i],
 						 data->pwm_override_duty[i]);
+			err = it87_bridge_fault(data);
+			if (err)
+				return err;
 			it87_disable_extra_vectors(data, i);
+			err = it87_bridge_fault(data);
+			if (err)
+				return err;
 		}
 	}
 
 	/* G1 changes ownership only after its conventional EC state is ready. */
 	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G1 &&
-	    it87_h2ram_override_mask(data))
+	    it87_h2ram_override_mask(data)) {
 		it87_h2ram_take_control(data);
+		err = it87_bridge_fault(data);
+		if (err)
+			return err;
+	}
+
+	return 0;
 }
 
 static void it87_update_pwm_ctrl(struct it87_data *data, int nr)
@@ -3474,6 +3502,7 @@ static void it87_restore_firmware_state(void *arg)
 {
 	struct it87_data *data = arg;
 	int bridge_err;
+	int restore_err;
 	int err;
 
 	if (!data->pwm_override_mask)
@@ -3488,11 +3517,12 @@ static void it87_restore_firmware_state(void *arg)
 	}
 
 	/* Reachable conventional state is still worth restoring after a fault. */
-	it87_restore_overrides_to_firmware(data, !bridge_err);
+	restore_err = it87_restore_overrides_to_firmware(data, !bridge_err);
 	data->suspend_defaults_restored = false;
 	it87_unlock(data);
 
-	bridge_err = it87_bridge_fault(data);
+	if (!bridge_err)
+		bridge_err = restore_err;
 	if (bridge_err)
 		pr_warn("firmware fan-state restoration for Super I/O %#x may be incomplete after ISA bridge error %d\n",
 			data->sioaddr, bridge_err);
@@ -7156,7 +7186,11 @@ static int it87_probe(struct platform_device *pdev)
 	hwmon_dev = devm_hwmon_device_register_with_groups(dev,
 			     it87_devices[sio_data->type].name,
 			     data, data->groups);
-	return PTR_ERR_OR_ZERO(hwmon_dev);
+	if (IS_ERR(hwmon_dev))
+		return PTR_ERR(hwmon_dev);
+
+	data->probe_complete = true;
+	return 0;
 }
 
 static void it87_resume_sio(struct platform_device *pdev)
@@ -7194,6 +7228,7 @@ static void it87_resume_sio(struct platform_device *pdev)
 static int it87_suspend(struct device *dev)
 {
 	struct it87_data *data = dev_get_drvdata(dev);
+	int restore_err;
 	int err;
 
 	err = it87_lock(data);
@@ -7206,19 +7241,28 @@ static int it87_suspend(struct device *dev)
 		 * desired software values in memory so a successful resume can retake
 		 * control without changing what "automatic" means.
 		 */
-		it87_restore_overrides_to_firmware(data, false);
-		data->suspend_defaults_restored = true;
+		err = it87_bridge_fault(data);
+		restore_err = it87_restore_overrides_to_firmware(data, false);
+		if (!err)
+			err = restore_err;
+		if (!err)
+			data->suspend_defaults_restored = true;
+		else
+			dev_err(dev,
+				"unable to verify firmware fan-state restoration: %d\n",
+				err);
 		data->valid = false;
 	}
 
 	it87_unlock(data);
-	return 0;
+	return err;
 }
 
 static int it87_resume(struct device *dev)
 {
 	struct platform_device *pdev = to_platform_device(dev);
 	struct it87_data *data = dev_get_drvdata(dev);
+	struct it87_data *updated;
 	int err;
 	int pwm_safe;
 
@@ -7231,15 +7275,44 @@ static int it87_resume(struct device *dev)
 	if (err)
 		return err;
 
+	err = it87_bridge_fault(data);
+	if (err)
+		goto out_unlock;
+
 	pwm_safe = it87_check_pwm(dev);
+	err = it87_bridge_fault(data);
+	if (err)
+		goto out_unlock;
+
 	it87_check_limit_regs(data);
+	err = it87_bridge_fault(data);
+	if (err)
+		goto out_unlock;
+
 	it87_check_voltage_monitors_reset(data);
+	err = it87_bridge_fault(data);
+	if (err)
+		goto out_unlock;
+
 	it87_check_tachometers_reset(pdev);
+	err = it87_bridge_fault(data);
+	if (err)
+		goto out_unlock;
+
 	it87_check_tachometers_16bit_mode(pdev);
+	err = it87_bridge_fault(data);
+	if (err)
+		goto out_unlock;
 
 	/* Only a sane resume that reached this point retakes software ownership. */
 	if (data->suspend_defaults_restored && pwm_safe) {
-		it87_reapply_overrides(data);
+		err = it87_reapply_overrides(data);
+		if (err) {
+			dev_err(dev,
+				"unable to reapply software fan control: %d\n",
+				err);
+			goto out_unlock;
+		}
 		data->suspend_defaults_restored = false;
 	} else if (data->suspend_defaults_restored) {
 		dev_warn(dev,
@@ -7247,13 +7320,19 @@ static int it87_resume(struct device *dev)
 	}
 
 	it87_start_monitoring(data);
+	err = it87_bridge_fault(data);
 
+out_unlock:
 	/* force update */
 	data->valid = false;
 
 	it87_unlock(data);
+	if (err)
+		return err;
 
-	it87_update_device(dev);
+	updated = it87_update_device(dev);
+	if (IS_ERR(updated))
+		return PTR_ERR(updated);
 
 	return 0;
 }
@@ -7264,9 +7343,24 @@ static struct platform_driver it87_driver = {
 	.driver = {
 		.name	= DRVNAME,
 		.pm	= pm_sleep_ptr(&it87_dev_pm_ops),
+		.probe_type = PROBE_FORCE_SYNCHRONOUS,
 	},
 	.probe	= it87_probe,
 };
+
+static bool it87_probe_completed(struct platform_device *pdev)
+{
+	struct it87_data *data;
+	bool complete;
+
+	device_lock(&pdev->dev);
+	data = platform_get_drvdata(pdev);
+	complete = pdev->dev.driver == &it87_driver.driver && data &&
+		   data->probe_complete;
+	device_unlock(&pdev->dev);
+
+	return complete;
+}
 
 static int __init it87_device_add(int index, unsigned short sio_address,
 				  phys_addr_t mmio_address,
@@ -7386,11 +7480,8 @@ static int __init it87_device_add(int index, unsigned short sio_address,
 		pr_err("Device addition failed (%d)\n", err);
 		goto exit_device_put;
 	}
-	/*
-	 * platform_device_add() probes synchronously by default but does not
-	 * return the probe error.  Never retain an unbound, unvalidated device.
-	 */
-	if (pdev->dev.driver != &it87_driver.driver) {
+	/* Never retain an unbound, incompletely validated device. */
+	if (!it87_probe_completed(pdev)) {
 		pr_err("Device probe failed for Super I/O at %#x\n",
 		       sio_address);
 		err = -ENODEV;
